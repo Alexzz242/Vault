@@ -21,3 +21,6 @@ watchdog>=4.0.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+# Tests
+pytest>=8.0.0
