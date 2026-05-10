@@ -2,70 +2,123 @@
 indexer.py — Scan files, parse content, chunk text, and index into vector store.
 """
 
+from __future__ import annotations
+
 import hashlib
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 from vault_core.embedder import embed_batch
-from vault_core.vector_store import upsert_chunks, delete_by_file
+from vault_core.vector_store import delete_by_file, upsert_chunks
 from config import (
-    SUPPORTED_EXTENSIONS, SKIP_DIRS,
-    CHUNK_SIZE, CHUNK_OVERLAP, MAX_FILE_SIZE_MB
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    MAX_FILE_SIZE_MB,
+    SKIP_DIRS,
+    SUPPORTED_EXTENSIONS,
 )
 
+_PLAIN_TEXT_SUFFIXES = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv"}
+_READ_CHUNK = 8192
 
-# ── Parsers ────────────────────────────────────────────────────────────────────
+
+def _is_probably_binary(path: Path) -> bool:
+    """Return True if the start of the file looks binary (e.g. contains NUL bytes)."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_READ_CHUNK)
+    except OSError:
+        return True
+    return b"\x00" in head
+
 
 def parse_file(path: Path) -> str | None:
-    """Extract plain text from a file. Returns None if unsupported or error."""
+    """
+    Extract plain text from a file. Returns None if unsupported, empty, binary, or on error.
+
+    Supported types match config.SUPPORTED_EXTENSIONS. Text-like types skip likely-binary files.
+    """
+    path = Path(path)
     suffix = path.suffix.lower()
     try:
-        if suffix in {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv"}:
+        if suffix in _PLAIN_TEXT_SUFFIXES:
+            if _is_probably_binary(path):
+                return None
             return path.read_text(encoding="utf-8", errors="ignore")
 
         if suffix == ".pdf":
             import pypdf
+
             reader = pypdf.PdfReader(str(path))
-            return "\n".join(p.extract_text() or "" for p in reader.pages)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
 
         if suffix == ".docx":
             from docx import Document
+
             doc = Document(str(path))
             return "\n".join(p.text for p in doc.paragraphs)
 
-    except Exception as e:
-        print(f"⚠️  Could not parse {path.name}: {e}")
+    except Exception as exc:
+        print(f"⚠️  Could not parse {path.name}: {exc}")
     return None
 
 
-# ── Chunking ───────────────────────────────────────────────────────────────────
+def chunk_text(
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> list[str]:
+    """
+    Split text into overlapping chunks using word counts (approximates token windows).
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into overlapping chunks by word count (approximates tokens)."""
+    Config CHUNK_SIZE / CHUNK_OVERLAP target token counts; word boundaries keep chunks readable.
+    Overlap is clamped so chunks always advance.
+    """
     words = text.split()
-    chunks = []
+    if not words:
+        return []
+
+    size = max(1, chunk_size)
+    ov = max(0, min(overlap, size - 1))
+    step = size - ov
+
+    chunks: list[str] = []
     start = 0
     while start < len(words):
-        end = start + chunk_size
-        chunks.append(" ".join(words[start:end]))
-        start += chunk_size - overlap
-    return [c for c in chunks if c.strip()]
+        end = min(start + size, len(words))
+        piece = " ".join(words[start:end])
+        if piece.strip():
+            chunks.append(piece)
+        if end >= len(words):
+            break
+        start += step
+
+    return chunks
 
 
 def make_chunk_id(file_path: str, chunk_index: int) -> str:
-    """Stable unique ID for a chunk: hash of path + index."""
+    """Stable unique ID for a chunk from resolved path string and chunk index (MD5 hex)."""
     raw = f"{file_path}::{chunk_index}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-# ── Indexing ───────────────────────────────────────────────────────────────────
-
-def index_file(path: Path) -> int:
+def index_file(path: Path | str) -> int:
     """
     Parse, chunk, embed, and store a single file.
-    Returns the number of chunks indexed.
+
+    Uses the resolved path for metadata and deletes so re-index and vector deletes stay aligned.
+
+    Returns:
+        Number of chunks stored, or 0 if skipped or empty.
     """
-    if path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+    path = Path(path).expanduser().resolve(strict=False)
+
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read file: {path}") from exc
+
+    if size > MAX_FILE_SIZE_MB * 1024 * 1024:
         print(f"⏭️  Skipping {path.name} (too large)")
         return 0
 
@@ -77,17 +130,18 @@ def index_file(path: Path) -> int:
     if not chunks:
         return 0
 
-    # Remove old chunks for this file before re-indexing
-    delete_by_file(str(path))
+    key = str(path)
+    delete_by_file(key)
 
     embeddings = embed_batch(chunks)
-    ids = [make_chunk_id(str(path), i) for i in range(len(chunks))]
+    ids = [make_chunk_id(key, i) for i in range(len(chunks))]
+    mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
     metadatas = [
         {
-            "file_path": str(path),
+            "file_path": key,
             "file_name": path.name,
             "chunk_index": i,
-            "last_modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+            "last_modified": mtime,
         }
         for i in range(len(chunks))
     ]
@@ -96,21 +150,26 @@ def index_file(path: Path) -> int:
     return len(chunks)
 
 
-def index_directory(directory: Path, verbose: bool = True) -> dict:
+def index_directory(directory: Path | str, verbose: bool = True) -> dict:
     """
-    Recursively index all supported files in a directory.
-    Returns a summary dict.
+    Recursively index supported files under directory, skipping configured path segments.
+
+    Returns:
+        Summary dict: files_indexed, chunks_total, errors, total_found.
     """
+    root = Path(directory).expanduser().resolve(strict=False)
+
+    all_files = sorted(
+        f.resolve(strict=False)
+        for f in root.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() in SUPPORTED_EXTENSIONS
+        and not any(part in SKIP_DIRS for part in f.parts)
+    )
+
     files_indexed = 0
     chunks_total = 0
     errors = 0
-
-    all_files = [
-        f for f in directory.rglob("*")
-        if f.is_file()
-        and f.suffix.lower() in SUPPORTED_EXTENSIONS
-        and not any(skip in f.parts for skip in SKIP_DIRS)
-    ]
 
     for file in all_files:
         if verbose:
@@ -120,8 +179,8 @@ def index_directory(directory: Path, verbose: bool = True) -> dict:
             if n > 0:
                 files_indexed += 1
                 chunks_total += n
-        except Exception as e:
-            print(f"❌ Error indexing {file.name}: {e}")
+        except Exception as exc:
+            print(f"❌ Error indexing {file.name}: {exc}")
             errors += 1
 
     return {
