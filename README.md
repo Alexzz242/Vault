@@ -34,7 +34,7 @@ cd vault
 bash scripts/setup.sh
 ```
 
-That's it. The script installs everything including the AI models.
+The script installs everything including the AI models.
 
 ---
 
@@ -84,7 +84,7 @@ Your question → embedded → top-5 relevant chunks retrieved
    ↓
 Mistral reads the chunks and answers your question
    ↓
-Answer + source files shown to you
+Answer + source files shown
 ```
 
 All inference runs on your hardware via Ollama. Tested on M4 MacBook Air 16GB.
@@ -100,9 +100,8 @@ Edit `config.py` to change models, chunk size, number of results, etc.
 ## Privacy
 
 - **Zero network requests** except to `localhost:11434` (Ollama)
-- No telemetry, no analytics
 - Index stored at `~/.vault/` — delete it anytime to wipe everything
-- Open source — read every line
+- Open source 
 
 ---
 
